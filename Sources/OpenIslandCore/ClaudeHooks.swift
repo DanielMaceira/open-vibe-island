@@ -949,7 +949,15 @@ public extension ClaudeHookPayload {
             environment: environment,
             currentTTYProvider: { currentTTY() },
             terminalLocatorProvider: { terminalLocator(for: $0) },
-            warpPaneResolver: Self.defaultWarpPaneResolver
+            warpPaneResolver: Self.defaultWarpPaneResolver,
+            backgroundViewerProvider: { payload in
+                ClaudeBackgroundSessionViewerResolver.selectViewer(
+                    from: ClaudeBackgroundSessionViewerResolver.liveViewers(),
+                    sessionID: payload.sessionID,
+                    sessionName: environment["CLAUDE_CODE_SESSION_NAME"],
+                    sessionWorkingDirectory: payload.cwd
+                )
+            }
         )
     }
 
@@ -975,12 +983,36 @@ public extension ClaudeHookPayload {
         environment: [String: String],
         currentTTYProvider: () -> String?,
         terminalLocatorProvider: (String) -> (sessionID: String?, tty: String?, title: String?),
-        warpPaneResolver: (String) -> String? = Self.defaultWarpPaneResolver
+        warpPaneResolver: (String) -> String? = Self.defaultWarpPaneResolver,
+        backgroundViewerProvider: (ClaudeHookPayload) -> ClaudeBackgroundSessionViewer? = { _ in nil }
     ) -> ClaudeHookPayload {
         var payload = self
+        var environment = environment
+
+        // Background sessions run under the Claude Code daemon with a
+        // scrubbed environment and a daemon-owned pty. Borrow the terminal
+        // context of the `claude attach` / `claude agents` viewer that
+        // displays the session so the jump target points at a real tab.
+        var backgroundViewer: ClaudeBackgroundSessionViewer?
+        if payload.terminalApp == nil,
+           payload.terminalTTY == nil,
+           ClaudeBackgroundSessionViewerResolver.isBackgroundSession(environment: environment),
+           let viewer = backgroundViewerProvider(payload) {
+            backgroundViewer = viewer
+            environment = ClaudeBackgroundSessionViewerResolver.mergedEnvironment(environment, viewer: viewer)
+        }
 
         if payload.terminalApp == nil {
             payload.terminalApp = inferTerminalApp(from: environment)
+        }
+
+        if let backgroundViewer {
+            payload.terminalTTY = backgroundViewer.terminalTTY
+            if payload.terminalApp == "iTerm", payload.terminalSessionID == nil {
+                payload.terminalSessionID = ClaudeBackgroundSessionViewerResolver.iTermSessionID(
+                    from: environment["ITERM_SESSION_ID"]
+                )
+            }
         }
 
         // Resolve Warp pane UUID from the live SQLite state.
@@ -1012,7 +1044,11 @@ public extension ClaudeHookPayload {
         }
 
         let useLocator: Bool
-        if isCmuxTerminalApp(payload.terminalApp) || isZellijTerminalApp(payload.terminalApp) {
+        if backgroundViewer != nil {
+            // The focused-terminal locator reports whatever tab is in front,
+            // which is unrelated to a background session's viewer.
+            useLocator = false
+        } else if isCmuxTerminalApp(payload.terminalApp) || isZellijTerminalApp(payload.terminalApp) {
             // cmux/Zellij session IDs come from environment variables;
             // no AppleScript locator is available, so skip entirely.
             useLocator = false

@@ -67,6 +67,17 @@ struct ActiveAgentProcessDiscovery {
         var claimedKeys: Set<String> = []
 
         for process in processes {
+            // Claude Code background session engines run under the daemon's
+            // pty host. Their pty is not a terminal tab, so they are matched
+            // by session ID only (the hook supplies the viewer's terminal).
+            if let snapshot = claudeBackgroundSessionSnapshot(for: process, processesByPID: processesByPID) {
+                if let sessionID = snapshot.sessionID,
+                   claimedKeys.insert("claude:\(sessionID)").inserted {
+                    snapshots.append(snapshot)
+                }
+                continue
+            }
+
             // Most agent detection requires a TTY (terminal-attached process).
             // OpenCode is an exception: it can run inside IDE integrated terminals
             // that don't expose a TTY in `ps` output. Let OpenCode processes
@@ -372,10 +383,56 @@ struct ActiveAgentProcessDiscovery {
         path.contains("/.claude/worktrees/agent-")
     }
 
+    /// Claude Code subcommands that manage or display sessions rather than
+    /// run one: the `claude agents` view, `claude attach` viewers, and the
+    /// daemon's own helper processes.
+    private static let claudeControlSubcommands: Set<String> = [
+        "agents", "attach", "daemon", "logs", "stop", "rm",
+        "bg-pty-host", "bg-spare", "--bg-pty-host", "--bg-spare",
+    ]
+
+    private func isClaudeControlProcess(command: String) -> Bool {
+        let tokens = command.split(whereSeparator: \.isWhitespace).map(String.init)
+        if tokens.count >= 2, Self.claudeControlSubcommands.contains(tokens[1]) {
+            return true
+        }
+        return tokens.contains("--bg-pty-host") || tokens.contains("--bg-spare")
+    }
+
+    /// The session engine spawned by Claude Code's background pty host
+    /// (`…/claude/versions/<v> --session-id <uuid> …`, parent `--bg-pty-host`).
+    private func claudeBackgroundSessionSnapshot(
+        for process: RunningProcess,
+        processesByPID: [String: RunningProcess]
+    ) -> ProcessSnapshot? {
+        guard let parent = processesByPID[process.parentPID],
+              parent.command.split(whereSeparator: \.isWhitespace).contains("--bg-pty-host"),
+              !isClaudeControlProcess(command: process.command),
+              let sessionID = claudeSessionID(from: process.command) else {
+            return nil
+        }
+
+        let lsofOutput = lsofOutput(pid: process.pid)
+        let workingDirectory = lsofOutput.flatMap(workingDirectory(from:))
+        return ProcessSnapshot(
+            tool: .claudeCode,
+            sessionID: sessionID,
+            workingDirectory: workingDirectory,
+            terminalTTY: nil,
+            transcriptPath: lsofOutput.flatMap {
+                bestClaudeTranscriptPath(in: $0, workingDirectory: workingDirectory)
+            }
+        )
+    }
+
     private func claudeSnapshot(
         for process: RunningProcess,
         processesByPID: [String: RunningProcess]
     ) -> ProcessSnapshot? {
+        if isClaudeControlProcess(command: process.command) {
+            return nil
+        }
+
         let lsofOutput = lsofOutput(pid: process.pid)
         let workingDirectory = lsofOutput.flatMap(workingDirectory(from:))
 
