@@ -41,14 +41,15 @@ public enum ClaudeBackgroundSessionViewerResolver {
         case agents(scope: String?)
     }
 
-    /// Terminal-identifying variables copied from the viewer into the hook's
-    /// environment before terminal inference. Kept to an explicit list so
-    /// unrelated viewer state never leaks into the payload.
+    /// Terminal-identifying variables taken from the viewer before terminal
+    /// inference. Kept to an explicit list so unrelated viewer state never
+    /// leaks into the payload.
     static let terminalEnvironmentKeys: [String] = [
         "TERM_PROGRAM",
         "TERM_PROGRAM_VERSION",
         "TERM_SESSION_ID",
         "ITERM_SESSION_ID",
+        "ITERM_PROFILE",
         "LC_TERMINAL",
         "__CFBundleIdentifier",
         "GHOSTTY_RESOURCES_DIR",
@@ -159,21 +160,41 @@ public enum ClaudeBackgroundSessionViewerResolver {
         return bestAgentsViewer
     }
 
-    /// Overlays the viewer's terminal-identifying variables onto the hook
-    /// environment. Variables already present in the hook environment win.
-    public static func mergedEnvironment(
-        _ environment: [String: String],
-        viewer: ClaudeBackgroundSessionViewer
+    /// Replaces the hook's terminal-identifying variables with the viewer's.
+    /// In a background session those variables are leaked from the tab that
+    /// started the daemon, so they are dropped even when no viewer is found.
+    public static func terminalEnvironment(
+        replacing environment: [String: String],
+        with viewer: ClaudeBackgroundSessionViewer?
     ) -> [String: String] {
-        var merged = environment
+        var result = environment
         for key in terminalEnvironmentKeys {
-            guard merged[key]?.isEmpty != false,
-                  let value = viewer.environment[key], !value.isEmpty else {
-                continue
+            if let value = viewer?.environment[key], !value.isEmpty {
+                result[key] = value
+            } else {
+                result.removeValue(forKey: key)
             }
-            merged[key] = value
         }
-        return merged
+        return result
+    }
+
+    /// The engine PID when the hook runs inside a Claude Code background
+    /// session, nil otherwise. Claude Code scrubs the daemon markers from
+    /// hook environments, so the engine (`CLAUDE_PID`) is inspected too.
+    static func backgroundAgentPID(
+        environment: [String: String],
+        processEnvironment: (Int32) -> [String: String]? = { processArguments(pid: $0)?.environment }
+    ) -> Int32? {
+        let enginePID = environment["CLAUDE_PID"].flatMap { Int32($0) }
+        if isBackgroundSession(environment: environment) {
+            return enginePID ?? getppid()
+        }
+        guard let enginePID,
+              let engineEnvironment = processEnvironment(enginePID),
+              isBackgroundSession(environment: engineEnvironment) else {
+            return nil
+        }
+        return enginePID
     }
 
     /// iTerm2 exports `ITERM_SESSION_ID` as `w0t0p0:<UUID>`; its AppleScript

@@ -8,7 +8,6 @@ struct ClaudeBackgroundSessionViewerTests {
     private static let backgroundEnvironment: [String: String] = [
         "CLAUDE_CODE_SESSION_KIND": "bg",
         "CLAUDE_BG_BACKEND": "daemon",
-        "CLAUDE_CODE_SESSION_NAME": "72e15398",
     ]
 
     private func viewer(
@@ -146,24 +145,58 @@ struct ClaudeBackgroundSessionViewerTests {
     // MARK: - Environment helpers
 
     @Test
-    func mergedEnvironmentCopiesOnlyMissingTerminalKeys() {
+    func terminalEnvironmentReplacesLeakedTerminalKeysWithViewerKeys() {
         let viewer = viewer(pid: 1, cwd: "/", arguments: ["claude", "agents"], environment: [
             "TERM_PROGRAM": "iTerm.app",
-            "ITERM_SESSION_ID": "w0t0p0:BF4CAE15-CFAB-4204-85C2-048613CB13C3",
+            "ITERM_SESSION_ID": "w1t0p0:E0568687-6BD1-4764-AFCB-723A070EA014",
             "HOME": "/Users/other",
             "CLAUDE_CODE_ENTRYPOINT": "cli",
         ])
+        let leaked = [
+            "CLAUDE_PID": "53912",
+            "TERM_SESSION_ID": "w0t0p0:BF4CAE15-CFAB-4204-85C2-048613CB13C3",
+            "ITERM_PROFILE": "Dev",
+        ]
 
-        let merged = Resolver.mergedEnvironment(
-            ["CLAUDE_BG_BACKEND": "daemon", "LC_TERMINAL": "kept"],
-            viewer: viewer
-        )
+        let replaced = Resolver.terminalEnvironment(replacing: leaked, with: viewer)
 
-        #expect(merged["TERM_PROGRAM"] == "iTerm.app")
-        #expect(merged["ITERM_SESSION_ID"] == "w0t0p0:BF4CAE15-CFAB-4204-85C2-048613CB13C3")
-        #expect(merged["LC_TERMINAL"] == "kept")
-        #expect(merged["HOME"] == nil)
-        #expect(merged["CLAUDE_CODE_ENTRYPOINT"] == nil)
+        #expect(replaced["TERM_PROGRAM"] == "iTerm.app")
+        #expect(replaced["ITERM_SESSION_ID"] == "w1t0p0:E0568687-6BD1-4764-AFCB-723A070EA014")
+        #expect(replaced["TERM_SESSION_ID"] == nil)
+        #expect(replaced["ITERM_PROFILE"] == nil)
+        #expect(replaced["CLAUDE_PID"] == "53912")
+        #expect(replaced["HOME"] == nil)
+        #expect(replaced["CLAUDE_CODE_ENTRYPOINT"] == nil)
+
+        let withoutViewer = Resolver.terminalEnvironment(replacing: leaked, with: nil)
+        #expect(withoutViewer == ["CLAUDE_PID": "53912"])
+    }
+
+    @Test
+    func backgroundAgentPIDReadsDaemonMarkersFromEngineWhenHookEnvironmentIsScrubbed() {
+        // Claude Code strips CLAUDE_CODE_SESSION_KIND / CLAUDE_BG_BACKEND
+        // from hook environments; the engine (CLAUDE_PID) still has them.
+        let scrubbedHookEnvironment = ["CLAUDE_PID": "53912", "CLAUDE_CODE_SESSION_ID": "s"]
+
+        #expect(Resolver.backgroundAgentPID(
+            environment: scrubbedHookEnvironment,
+            processEnvironment: { $0 == 53912 ? ["CLAUDE_CODE_SESSION_KIND": "bg"] : nil }
+        ) == 53912)
+        #expect(Resolver.backgroundAgentPID(
+            environment: scrubbedHookEnvironment,
+            processEnvironment: { _ in ["TERM_PROGRAM": "iTerm.app"] }
+        ) == nil)
+        #expect(Resolver.backgroundAgentPID(
+            environment: ["TERM_PROGRAM": "iTerm.app"],
+            processEnvironment: { _ in
+                Issue.record("no engine PID to inspect")
+                return nil
+            }
+        ) == nil)
+        #expect(Resolver.backgroundAgentPID(
+            environment: ["CLAUDE_BG_BACKEND": "daemon", "CLAUDE_PID": "77"],
+            processEnvironment: { _ in nil }
+        ) == 77)
     }
 
     @Test
@@ -241,13 +274,17 @@ struct ClaudeBackgroundSessionViewerTests {
 
         var requestedSessionID: String?
         let enriched = payload.withRuntimeContext(
-            environment: Self.backgroundEnvironment,
-            currentTTYProvider: { "/dev/ttys002" },
+            environment: ["CLAUDE_PID": "53912", "TERM_SESSION_ID": "w9t0p0:LEAKED"],
+            currentTTYProvider: {
+                Issue.record("the engine pty belongs to the daemon")
+                return "/dev/ttys002"
+            },
             terminalLocatorProvider: { _ in
                 Issue.record("focused-terminal locator must not run for background sessions")
                 return (sessionID: "focused-tab", tty: "/dev/ttys004", title: "wrong")
             },
             warpPaneResolver: { _ in nil },
+            backgroundAgentPIDProvider: { $0["CLAUDE_PID"].flatMap { Int32($0) } },
             backgroundViewerProvider: { payload in
                 requestedSessionID = payload.sessionID
                 return iTermViewer
@@ -259,26 +296,36 @@ struct ClaudeBackgroundSessionViewerTests {
         #expect(enriched.terminalSessionID == "BF4CAE15-CFAB-4204-85C2-048613CB13C3")
         #expect(enriched.terminalTTY == "/dev/ttys000")
         #expect(enriched.terminalTitle == nil)
+        #expect(enriched.backgroundAgentPID == 53912)
+        #expect(enriched.defaultJumpTarget.backgroundAgentPID == 53912)
     }
 
     @Test
-    func backgroundSessionWithoutViewerKeepsUnknownTerminal() {
+    func backgroundSessionWithoutViewerDropsLeakedTerminalContext() {
         let payload = ClaudeHookPayload(
-            cwd: "/Users/me/dev/local",
+            cwd: "/Users/me/dev/myvillage",
             hookEventName: .stop,
-            sessionID: "72e15398-ff3d-4a74-9d70-2424686dccdc"
+            sessionID: "f52f1ced-3bcb-44e1-907d-8b582c52658c"
         )
 
         let enriched = payload.withRuntimeContext(
-            environment: Self.backgroundEnvironment,
+            environment: [
+                "CLAUDE_PID": "54030",
+                "TERM_SESSION_ID": "w0t0p0:BF4CAE15-CFAB-4204-85C2-048613CB13C3",
+                "ITERM_PROFILE": "Dev",
+            ],
             currentTTYProvider: { "/dev/ttys002" },
-            terminalLocatorProvider: { _ in (sessionID: nil, tty: nil, title: nil) },
+            terminalLocatorProvider: { _ in (sessionID: "focused-tab", tty: "/dev/ttys000", title: "wrong") },
             warpPaneResolver: { _ in nil },
+            backgroundAgentPIDProvider: { _ in 54030 },
             backgroundViewerProvider: { _ in nil }
         )
 
         #expect(enriched.terminalApp == nil)
-        #expect(enriched.terminalTTY == "/dev/ttys002")
+        #expect(enriched.terminalSessionID == nil)
+        #expect(enriched.terminalTTY == nil)
+        #expect(enriched.backgroundAgentPID == 54030)
+        #expect(enriched.defaultJumpTarget.terminalApp == "Unknown")
     }
 
     @Test
@@ -294,6 +341,7 @@ struct ClaudeBackgroundSessionViewerTests {
             currentTTYProvider: { "/dev/ttys007" },
             terminalLocatorProvider: { _ in (sessionID: nil, tty: "/dev/ttys007", title: "zsh") },
             warpPaneResolver: { _ in nil },
+            backgroundAgentPIDProvider: { _ in nil },
             backgroundViewerProvider: { _ in
                 Issue.record("background viewer lookup must only run for daemon sessions")
                 return nil
@@ -302,5 +350,23 @@ struct ClaudeBackgroundSessionViewerTests {
 
         #expect(enriched.terminalApp == "Terminal")
         #expect(enriched.terminalTTY == "/dev/ttys007")
+        #expect(enriched.backgroundAgentPID == nil)
+    }
+
+    @Test
+    func backgroundAgentPIDRoundTripsThroughHookJSON() throws {
+        var payload = ClaudeHookPayload(cwd: "/tmp", hookEventName: .stop, sessionID: "s1")
+        payload.backgroundAgentPID = 53912
+
+        let data = try JSONEncoder().encode(payload)
+        let json = try #require(String(data: data, encoding: .utf8))
+        #expect(json.contains("\"background_agent_pid\":53912"))
+        #expect(try JSONDecoder().decode(ClaudeHookPayload.self, from: data).backgroundAgentPID == 53912)
+
+        let legacy = try JSONDecoder().decode(
+            JumpTarget.self,
+            from: Data(#"{"terminalApp":"iTerm","workspaceName":"local","paneTitle":"Claude"}"#.utf8)
+        )
+        #expect(legacy.backgroundAgentPID == nil)
     }
 }

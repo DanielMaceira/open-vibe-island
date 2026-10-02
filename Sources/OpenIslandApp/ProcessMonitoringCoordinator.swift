@@ -143,7 +143,10 @@ final class ProcessMonitoringCoordinator {
                         if shouldResolveTerminals {
                             g = probe.ghosttySnapshotAvailability()
                             t = probe.terminalSnapshotAvailability()
-                            j = resolver.resolveJumpTargets(for: liveSessions, activeProcesses: s)
+                            j = resolver.resolveJumpTargets(
+                                for: liveSessions,
+                                activeProcesses: s.filter { !$0.isClaudeDaemonHosted }
+                            )
                         } else {
                             g = .available([], appIsRunning: false)
                             t = .available([], appIsRunning: false)
@@ -208,7 +211,12 @@ final class ProcessMonitoringCoordinator {
         preResolvedJumpTargets: [String: JumpTarget]? = nil,
         observedCodexAppRunning: Bool? = nil
     ) {
-        let activeProcesses = activeProcesses ?? activeAgentProcessDiscovery.discover()
+        let discoveredProcesses = activeProcesses ?? activeAgentProcessDiscovery.discover()
+        // Daemon-hosted Claude engines/spares have no terminal tab and only
+        // feed liveness; keep them out of TTY/cwd matching, synthetic
+        // sessions and terminal resolution.
+        let daemonHostedClaudeProcesses = discoveredProcesses.filter(\.isClaudeDaemonHosted)
+        let activeProcesses = discoveredProcesses.filter { !$0.isClaudeDaemonHosted }
 
         // Work on a local copy to avoid triggering didSet (and its queue.sync +
         // view invalidation) on every intermediate mutation.
@@ -281,7 +289,8 @@ final class ProcessMonitoringCoordinator {
         // Phase 1: populate isProcessAlive in parallel with existing system.
         let aliveIDs = sessionIDsWithAliveProcesses(
             activeProcesses: activeProcesses,
-            isCodexAppRunning: isCodexAppRunning
+            isCodexAppRunning: isCodexAppRunning,
+            daemonHostedClaudeProcesses: daemonHostedClaudeProcesses
         )
         _ = local.markProcessLiveness(
             aliveSessionIDs: aliveIDs,
@@ -399,10 +408,25 @@ final class ProcessMonitoringCoordinator {
     /// Codex/Claude/Gemini).
     func sessionIDsWithAliveProcesses(
         activeProcesses: [ActiveProcessSnapshot],
-        isCodexAppRunning: Bool
+        isCodexAppRunning: Bool,
+        daemonHostedClaudeProcesses: [ActiveProcessSnapshot] = []
     ) -> Set<String> {
         var aliveIDs: Set<String> = []
         let sessions = state.sessions
+
+        // Claude Code background sessions: the engine runs under the daemon
+        // (no terminal tab). Match by `--session-id` or by the engine PID
+        // the hook recorded in the jump target.
+        if !daemonHostedClaudeProcesses.isEmpty {
+            let daemonSessionIDs = Set(daemonHostedClaudeProcesses.compactMap(\.sessionID))
+            let daemonPIDs = Set(daemonHostedClaudeProcesses.compactMap { $0.processID.flatMap { Int32($0) } })
+            for session in sessions where session.tool == .claudeCode && !session.isDemoSession {
+                if daemonSessionIDs.contains(session.id)
+                    || session.jumpTarget?.backgroundAgentPID.map(daemonPIDs.contains) == true {
+                    aliveIDs.insert(session.id)
+                }
+            }
+        }
 
         // Codex CLI sessions: match by session ID directly.
         let codexProcessIDs = Set(

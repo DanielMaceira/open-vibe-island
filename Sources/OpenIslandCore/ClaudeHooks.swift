@@ -366,6 +366,7 @@ public struct ClaudeHookPayload: Equatable, Codable, Sendable {
     public var terminalSessionID: String?
     public var terminalTTY: String?
     public var terminalTitle: String?
+    public var backgroundAgentPID: Int32?
     /// Warp-specific per-pane identifier discovered via Warp's SQLite state
     /// at hook runtime. Not sent over the wire by the hook script — populated
     /// in `withRuntimeContext` and serialized through the bridge.
@@ -410,6 +411,7 @@ public struct ClaudeHookPayload: Equatable, Codable, Sendable {
         case terminalSessionID = "terminal_session_id"
         case terminalTTY = "terminal_tty"
         case terminalTitle = "terminal_title"
+        case backgroundAgentPID = "background_agent_pid"
         case warpPaneUUID = "warp_pane_uuid"
         case remote
     }
@@ -699,7 +701,8 @@ public extension ClaudeHookPayload {
             workingDirectory: cwd,
             terminalSessionID: terminalSessionID,
             terminalTTY: terminalTTY,
-            warpPaneUUID: warpPaneUUID
+            warpPaneUUID: warpPaneUUID,
+            backgroundAgentPID: backgroundAgentPID
         )
     }
 
@@ -950,11 +953,12 @@ public extension ClaudeHookPayload {
             currentTTYProvider: { currentTTY() },
             terminalLocatorProvider: { terminalLocator(for: $0) },
             warpPaneResolver: Self.defaultWarpPaneResolver,
+            backgroundAgentPIDProvider: { ClaudeBackgroundSessionViewerResolver.backgroundAgentPID(environment: $0) },
             backgroundViewerProvider: { payload in
                 ClaudeBackgroundSessionViewerResolver.selectViewer(
                     from: ClaudeBackgroundSessionViewerResolver.liveViewers(),
                     sessionID: payload.sessionID,
-                    sessionName: environment["CLAUDE_CODE_SESSION_NAME"],
+                    sessionName: nil,
                     sessionWorkingDirectory: payload.cwd
                 )
             }
@@ -984,22 +988,30 @@ public extension ClaudeHookPayload {
         currentTTYProvider: () -> String?,
         terminalLocatorProvider: (String) -> (sessionID: String?, tty: String?, title: String?),
         warpPaneResolver: (String) -> String? = Self.defaultWarpPaneResolver,
+        backgroundAgentPIDProvider: ([String: String]) -> Int32? = { _ in nil },
         backgroundViewerProvider: (ClaudeHookPayload) -> ClaudeBackgroundSessionViewer? = { _ in nil }
     ) -> ClaudeHookPayload {
         var payload = self
         var environment = environment
 
         // Background sessions run under the Claude Code daemon with a
-        // scrubbed environment and a daemon-owned pty. Borrow the terminal
-        // context of the `claude attach` / `claude agents` viewer that
-        // displays the session so the jump target points at a real tab.
+        // daemon-owned pty, and their hooks inherit terminal variables
+        // leaked from whichever tab started the daemon. Record the engine
+        // PID for liveness and borrow the terminal context of the
+        // `claude attach` / `claude agents` viewer that displays the
+        // session so the jump target points at the right tab.
+        var isBackgroundSession = false
         var backgroundViewer: ClaudeBackgroundSessionViewer?
         if payload.terminalApp == nil,
            payload.terminalTTY == nil,
-           ClaudeBackgroundSessionViewerResolver.isBackgroundSession(environment: environment),
-           let viewer = backgroundViewerProvider(payload) {
-            backgroundViewer = viewer
-            environment = ClaudeBackgroundSessionViewerResolver.mergedEnvironment(environment, viewer: viewer)
+           let agentPID = backgroundAgentPIDProvider(environment) {
+            isBackgroundSession = true
+            payload.backgroundAgentPID = agentPID
+            backgroundViewer = backgroundViewerProvider(payload)
+            environment = ClaudeBackgroundSessionViewerResolver.terminalEnvironment(
+                replacing: environment,
+                with: backgroundViewer
+            )
         }
 
         if payload.terminalApp == nil {
@@ -1039,12 +1051,13 @@ public extension ClaudeHookPayload {
             }
         }
 
-        if payload.terminalTTY == nil {
+        // A background session's own pty belongs to the daemon, not to a tab.
+        if payload.terminalTTY == nil, !isBackgroundSession {
             payload.terminalTTY = currentTTYProvider()
         }
 
         let useLocator: Bool
-        if backgroundViewer != nil {
+        if isBackgroundSession {
             // The focused-terminal locator reports whatever tab is in front,
             // which is unrelated to a background session's viewer.
             useLocator = false
