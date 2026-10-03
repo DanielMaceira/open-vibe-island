@@ -140,6 +140,53 @@ struct ClaudeBackgroundSessionDiscoveryTests {
 
     @MainActor
     @Test
+    func unclaimedDaemonSparesNeverStayAliveEvenWithLivePID() {
+        var state = SessionState(sessions: [
+            AgentSession(
+                id: "4224385d-7e48-4983-a472-424799717f5b",
+                title: "Claude · local",
+                tool: .claudeCode,
+                phase: .completed,
+                summary: "Ready",
+                updatedAt: .now,
+                jumpTarget: JumpTarget(
+                    terminalApp: "iTerm",
+                    workspaceName: "local",
+                    paneTitle: "Claude",
+                    workingDirectory: "/Users/test/dev/local",
+                    backgroundAgentPID: 21694
+                )
+            ),
+        ])
+        let coordinator = ProcessMonitoringCoordinator()
+        coordinator.syntheticClaudeSessionPrefix = "claude-process:"
+        coordinator.stateAccessor = { state }
+        coordinator.stateUpdater = { state = $0 }
+
+        let spare = ActiveAgentProcessDiscovery.ProcessSnapshot(
+            tool: .claudeCode,
+            sessionID: nil,
+            workingDirectory: nil,
+            terminalTTY: nil,
+            processID: "21694",
+            isClaudeDaemonHosted: true
+        )
+
+        #expect(coordinator.sessionIDsWithAliveProcesses(
+            activeProcesses: [],
+            isCodexAppRunning: false,
+            daemonHostedClaudeProcesses: [spare]
+        ) == ["4224385d-7e48-4983-a472-424799717f5b"])
+        #expect(coordinator.sessionIDsWithAliveProcesses(
+            activeProcesses: [],
+            isCodexAppRunning: false,
+            daemonHostedClaudeProcesses: [spare],
+            unclaimedSpareSessionIDs: ["4224385d-7e48-4983-a472-424799717f5b"]
+        ).isEmpty)
+    }
+
+    @MainActor
+    @Test
     func daemonHostedProcessesNeverBecomeSyntheticSessions() {
         var state = SessionState(sessions: [])
         let coordinator = ProcessMonitoringCoordinator()

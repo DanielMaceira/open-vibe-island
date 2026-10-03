@@ -290,7 +290,10 @@ final class ProcessMonitoringCoordinator {
         let aliveIDs = sessionIDsWithAliveProcesses(
             activeProcesses: activeProcesses,
             isCodexAppRunning: isCodexAppRunning,
-            daemonHostedClaudeProcesses: daemonHostedClaudeProcesses
+            daemonHostedClaudeProcesses: daemonHostedClaudeProcesses,
+            unclaimedSpareSessionIDs: daemonHostedClaudeProcesses.isEmpty
+                ? []
+                : ClaudeDaemonRoster.unclaimedSpareSessionIDs(at: ClaudeDaemonRoster.rosterURL())
         )
         _ = local.markProcessLiveness(
             aliveSessionIDs: aliveIDs,
@@ -409,18 +412,22 @@ final class ProcessMonitoringCoordinator {
     func sessionIDsWithAliveProcesses(
         activeProcesses: [ActiveProcessSnapshot],
         isCodexAppRunning: Bool,
-        daemonHostedClaudeProcesses: [ActiveProcessSnapshot] = []
+        daemonHostedClaudeProcesses: [ActiveProcessSnapshot] = [],
+        unclaimedSpareSessionIDs: Set<String> = []
     ) -> Set<String> {
         var aliveIDs: Set<String> = []
         let sessions = state.sessions
 
         // Claude Code background sessions: the engine runs under the daemon
         // (no terminal tab). Match by `--session-id` or by the engine PID
-        // the hook recorded in the jump target.
+        // the hook recorded in the jump target. Warm spares that no dispatch
+        // has claimed are not user sessions and never stay alive.
         if !daemonHostedClaudeProcesses.isEmpty {
             let daemonSessionIDs = Set(daemonHostedClaudeProcesses.compactMap(\.sessionID))
             let daemonPIDs = Set(daemonHostedClaudeProcesses.compactMap { $0.processID.flatMap { Int32($0) } })
-            for session in sessions where session.tool == .claudeCode && !session.isDemoSession {
+            for session in sessions where session.tool == .claudeCode
+                && !session.isDemoSession
+                && !unclaimedSpareSessionIDs.contains(session.id.lowercased()) {
                 if daemonSessionIDs.contains(session.id)
                     || session.jumpTarget?.backgroundAgentPID.map(daemonPIDs.contains) == true {
                     aliveIDs.insert(session.id)
