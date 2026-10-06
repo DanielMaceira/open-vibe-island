@@ -10,7 +10,7 @@ import Foundation
 /// it spawns — has a scrubbed environment and a daemon-owned pty, so the
 /// usual `TERM_PROGRAM` / `ITERM_SESSION_ID` / TTY signals point nowhere.
 /// The process the user actually looks at is the viewer in a terminal tab.
-public struct ClaudeBackgroundSessionViewer: Equatable, Sendable {
+public struct ClaudeBackgroundSessionViewer: Equatable, Codable, Sendable {
     public var pid: Int32
     public var terminalTTY: String?
     public var workingDirectory: String?
